@@ -1,5 +1,10 @@
+#![allow(clippy::panic)] // Panic only during build time.
+
 use std::{
-    env, fs, fs::{File, OpenOptions}, path::{Path, PathBuf}
+    env,
+    fs::File,
+    io::{self, Write as _},
+    path::{Path, PathBuf},
 };
 use std::io::{self, Write, BufReader, BufRead};
 
@@ -16,13 +21,36 @@ const LIB_BASE: &str = "open62541";
 /// the `cc` build adds it as `rustc-link-lib` automatically.
 const LIB_EXT: &str = "open62541-ext";
 
+/// Pattern to search for compatibility with Edition 2024.
+///
+/// See also [`LEGACY_EXTERN_REPLACEMENT`].
+const LEGACY_EXTERN_PATTERN: &str = r#"extern "C" {"#;
+
+/// Replacement to use for compatibility with Edition 2024.
+///
+/// See also [`LEGACY_EXTERN_PATTERN`].
+const LEGACY_EXTERN_REPLACEMENT: &str = r#"unsafe extern "C" {"#;
+
 fn main() {
-    let src = env::current_dir().unwrap();
+    let with_mbedtls =
+        matches!(env::var("CARGO_FEATURE_MBEDTLS"), Ok(mbedtls) if !mbedtls.is_empty());
+    let with_openssl =
+        matches!(env::var("CARGO_FEATURE_OPENSSL"), Ok(openssl) if !openssl.is_empty());
+    // For now, we do not actually announce feature flag `openssl` in `Cargo.toml`.
+    let encryption = match (with_mbedtls, with_openssl) {
+        (false, false) => None,
+        (true, false) => Some(Encryption::MbedTls),
+        (false, true) => Some(Encryption::OpenSsl),
+        _ => panic!("conflicting encryption feature flags, only one must be enabled"),
+    };
+
+    let src = env::current_dir().expect("should get current directory");
 
     // Base path for nodesets
     let nodesets_dir = src.join("src/nodesets");
 
     // Get derived paths relative to `src`.
+    let src_mbedtls = src.join("mbedtls");
     let src_open62541 = src.join("open62541");
     let src_wrapper_c = src.join("wrapper.c");
     let src_wrapper_h = src.join("wrapper.h");
@@ -36,35 +64,14 @@ fn main() {
     println!("cargo:rerun-if-changed={}", src_wrapper_c.display());
     println!("cargo:rerun-if-changed={}", src_wrapper_h.display());
 
-    // Build bundled copy of `open62541` with CMake.
-    let mut cmake = cmake::Config::new(src_open62541);
-    cmake
-        // Use explicit paths here to avoid generating files where we do not expect them below.
-        .define("CMAKE_INSTALL_INCLUDEDIR", CMAKE_INCLUDE)
-        // Some systems (Fedora) default to `lib64/` instead of `lib/` for 64-bit libraries.
-        .define("CMAKE_INSTALL_LIBDIR", CMAKE_LIB)
-        // Explicitly set C99 standard to force Windows variants of `vsnprintf()` to conform to this
-        // standard. This also matches the expected (or supported) C standard of `open62541` itself.
-        .define("C_STANDARD", "99")
-        // Python defaults to creating bytecode in `__pycache__` directories. During build, this may
-        // happen when the tool `nodeset_compiler` is called. When we package a crate, builds should
-        // never modify files outside of `OUT_DIR`, so we disable the cache to prevent this.
-        .env("PYTHONDONTWRITEBYTECODE", "1");
+    // Build related encryption libraries.
+    let encryption_dst = encryption.map(|encryption| match encryption {
+        Encryption::MbedTls => prepare_mbedtls(src_mbedtls),
+        Encryption::OpenSsl => prepare_openssl(),
+    });
 
-    if matches!(env::var("CARGO_CFG_TARGET_ENV"), Ok(env) if env == "musl") {
-        let arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap();
-        // We require includes from the Linux headers which are not provided automatically when musl
-        // is targeted (see https://github.com/open62541/open62541/issues/6360).
-        // TODO: Remove this when `open62541` enables us to build without including Linux headers.
-        cmake
-            .cflag("-idirafter/usr/include")
-            .cflag(format!("-idirafter/usr/include/{arch}-linux-gnu"));
-    }
-
-    // Full namespace zero is required for the compiled nodesets.
-    cmake.define("UA_NAMESPACE_ZERO", "FULL");
-
-    let dst = cmake.build();
+    // Build `open62541` library.
+    let dst = build_open62541(src_open62541, encryption_dst.as_ref());
 
     // Get derived paths relative to `dst`.
     let dst_include = dst.join(CMAKE_INCLUDE);
@@ -79,7 +86,16 @@ fn main() {
     println!("cargo:rustc-link-search={}", dst_lib.display());
     println!("cargo:rustc-link-lib={LIB_BASE}");
 
-    let out = PathBuf::from(env::var("OUT_DIR").unwrap());
+    // For encryption support enabled, we add the libraries that have to be used as dependencies for
+    // the final build artifact.
+    //
+    // Note: These must come _after_ adding `LIB_BASE` above for linker to resolve dependencies.
+    if let Some(encryption_dst) = encryption_dst {
+        encryption_dst.rustc_link_search();
+        encryption_dst.rustc_link_lib();
+    }
+
+    let out = PathBuf::from(env::var("OUT_DIR").expect("should have OUT_DIR"));
 
     // Get derived paths relative to `out`.
     let out_bindings_rs = out.join("bindings.rs");
@@ -116,7 +132,7 @@ fn main() {
         // The auto-derived comments are not particularly useful because they often do not match the
         // declaration they belong to.
         .generate_comments(false)
-        .header(src_wrapper_h.to_str().unwrap())
+        .header(src_wrapper_h.to_str().expect("should be valid path"))
         // Activate parse callbacks. This causes cargo to invalidate the generated bindings when any
         // of the included files change. It also enables us to rename items in the final bindings.
         .parse_callbacks(Box::new(CustomCallbacks { dst }))
@@ -127,7 +143,7 @@ fn main() {
         .wrap_static_fns(true)
         // Make sure to specify the location of the resulting `extern.c`. By default `bindgen` would
         // place it in the temporary directory.
-        .wrap_static_fns_path(out_extern_c.to_str().unwrap());
+        .wrap_static_fns_path(out_extern_c.to_str().expect("should be valid path"));
 
     for dir in &include_dirs {
        builder = builder.clang_arg(format!("-I{}", dir.display()));
@@ -138,8 +154,21 @@ fn main() {
         .expect("should generate `Bindings` instance");
 
     bindings
-        .write_to_file(out_bindings_rs)
+        .write_to_file(out_bindings_rs.clone())
         .expect("should write `bindings.rs`");
+
+    // Until <https://github.com/rust-lang/rust-bindgen/issues/2901> is resolved, we replace `extern
+    // "C"` with `unsafe extern "C"` manually here. Remove this when `bindgen` is able to do it.
+    if version_check::is_min_version("1.82.0") == Some(true) {
+        // We can only use `unsafe extern` starting with Rust 1.82.0. See
+        // <https://blog.rust-lang.org/2024/10/17/Rust-1.82.0.html#safe-items-with-unsafe-extern>.
+        replace_in_file(
+            &out_bindings_rs,
+            LEGACY_EXTERN_PATTERN,
+            LEGACY_EXTERN_REPLACEMENT,
+        )
+        .expect("should add unsafe to extern statements");
+    }
 
     // Build `extern.c` and our custom `wrapper.c` that both hold additional helpers that we want to
     // link in addition to the base `open62541` library.
@@ -153,7 +182,7 @@ fn main() {
         // Explicitly disable deprecation warnings (seem to be enabled even when other warnings have
         // been disabled above).
         .flag_if_supported("-Wno-deprecated-declarations")
-        .flag_if_supported("-Wno-deprecated");
+	.flag_if_supported("-Wno-deprecated");
         // Add each .c file and include directory from the parsed nodesets
         for c_file in &c_files {
             build.file(c_file);
@@ -164,6 +193,199 @@ fn main() {
         }
         // Compile the library
         build.compile(LIB_EXT);
+}
+
+#[derive(Debug)]
+enum Encryption {
+    MbedTls,
+    OpenSsl,
+}
+
+#[derive(Debug)]
+enum EncryptionDst {
+    MbedTls {
+        dst: PathBuf,
+        libs: Vec<&'static str>,
+    },
+    OpenSsl {
+        search: Option<&'static str>,
+        libs: Vec<&'static str>,
+    },
+}
+
+impl EncryptionDst {
+    const fn search(&self) -> Option<&'static str> {
+        match self {
+            EncryptionDst::MbedTls { .. } => None,
+            EncryptionDst::OpenSsl { search, .. } => *search,
+        }
+    }
+
+    fn libs(&self) -> &[&'static str] {
+        match self {
+            EncryptionDst::MbedTls { libs, .. } | EncryptionDst::OpenSsl { libs, .. } => libs,
+        }
+    }
+
+    fn rustc_link_search(&self) {
+        if let Some(search) = self.search() {
+            println!("cargo:rustc-link-search={search}");
+        }
+    }
+
+    fn rustc_link_lib(&self) {
+        for lib in self.libs() {
+            println!("cargo:rustc-link-lib={lib}");
+        }
+    }
+}
+
+fn prepare_mbedtls(src: PathBuf) -> EncryptionDst {
+    // Build bundled copy of `mbedtls` with CMake.
+    let mut cmake = cmake::Config::new(src);
+    cmake
+        // Use explicit paths here to avoid generating files where we do not expect them below.
+        .define("CMAKE_INSTALL_INCLUDEDIR", CMAKE_INCLUDE)
+        // Some systems (Fedora) default to `lib64/` instead of `lib/` for 64-bit libraries.
+        .define("CMAKE_INSTALL_LIBDIR", CMAKE_LIB)
+        // Use same C99 standard as is used for building `open62541`.
+        .define("C_STANDARD", "99")
+        // Skip building binary programs unnecessary for linking library.
+        .define("ENABLE_PROGRAMS", "OFF")
+        // Skip building test programs that we are not going to run anyway.
+        .define("ENABLE_TESTING", "OFF");
+
+    let dst = cmake.build();
+
+    // The set of MbedTLS libraries that must be linked to work with `open62541` has been taken from
+    // <https://github.com/open62541/open62541/blob/master/tools/cmake/FindMbedTLS.cmake>.
+    let mut libs = vec!["mbedtls", "mbedx509", "mbedcrypto"];
+
+    if matches!(env::var("CARGO_CFG_TARGET_OS"), Ok(os) if os == "windows") {
+        // For some reason, newer Rust versions (?) require an explicit import of `bcrypt.lib` while
+        // older Rust versions (?) seem fine without this import. Add it regardless.
+        libs.push("bcrypt");
+    }
+
+    EncryptionDst::MbedTls { dst, libs }
+}
+
+fn prepare_openssl() -> EncryptionDst {
+    // For macOS, we require the precise link path because we expect OpenSSL to be provided by using
+    // Homebrew.
+    let search = matches!(env::var("CARGO_CFG_TARGET_OS"), Ok(os) if os == "macos")
+        .then_some("/opt/homebrew/opt/openssl/lib");
+
+    let libs = vec!["ssl", "crypto"];
+
+    EncryptionDst::OpenSsl { search, libs }
+}
+
+fn build_open62541(src: PathBuf, encryption: Option<&EncryptionDst>) -> PathBuf {
+    // Build bundled copy of `open62541` with CMake.
+    let mut cmake = cmake::Config::new(src);
+    cmake
+        // Use explicit paths here to avoid generating files where we do not expect them below.
+        .define("CMAKE_INSTALL_INCLUDEDIR", CMAKE_INCLUDE)
+        // Some systems (Fedora) default to `lib64/` instead of `lib/` for 64-bit libraries.
+        .define("CMAKE_INSTALL_LIBDIR", CMAKE_LIB)
+        // Explicitly set C99 standard to force Windows variants of `vsnprintf()` to conform to this
+        // standard. This also matches the expected (or supported) C standard of `open62541` itself.
+        .define("C_STANDARD", "99")
+        // Python defaults to creating bytecode in `__pycache__` directories. During build, this may
+        // happen when the tool `nodeset_compiler` is called. When we package a crate, builds should
+        // never modify files outside of `OUT_DIR`, so we disable the cache to prevent this.
+        .env("PYTHONDONTWRITEBYTECODE", "1");
+
+    if matches!(env::var("CARGO_CFG_TARGET_ENV"), Ok(env) if env == "musl") {
+        let arch = env::var("CARGO_CFG_TARGET_ARCH").expect("should have CARGO_CFG_TARGET_ARCH");
+        // We require includes from the Linux headers which are not provided automatically when musl
+        // is targeted (see https://github.com/open62541/open62541/issues/6360).
+        // TODO: Remove this when `open62541` enables us to build without including Linux headers.
+        cmake
+            .cflag("-idirafter/usr/include")
+            .cflag(format!("-idirafter/usr/include/{arch}-linux-gnu"));
+    }
+
+    // When enabled, we build `open62541` with encryption support. This changes the library and also
+    // changes the resulting `bindings.rs`.
+    let encryption = match encryption {
+        None => "OFF",
+        Some(EncryptionDst::MbedTls { dst, .. }) => {
+            // Skip auto-detection and use explicit folders from `mbedtls` build.
+            cmake
+                .define("MBEDTLS_FOLDER_INCLUDE", dst.join(CMAKE_INCLUDE))
+                .define("MBEDTLS_FOLDER_LIBRARY", dst.join(CMAKE_LIB));
+            "MBEDTLS"
+        }
+        Some(EncryptionDst::OpenSsl { .. }) => "OPENSSL",
+    };
+
+    cmake.define("UA_ENABLE_ENCRYPTION", encryption);
+
+    // Full namespace zero is required for the compiled nodesets.
+    cmake.define("UA_NAMESPACE_ZERO", "FULL");
+
+    cmake.build()
+}
+
+#[derive(Debug)]
+struct CustomCallbacks {
+    /// Destination of CMake build of `open62541`.
+    dst: PathBuf,
+}
+
+impl CustomCallbacks {
+    /// Checks if `filename` is inside CMake destination.
+    ///
+    /// This may be used to ensure that we do not run a rebuild when files generated by CMake change
+    /// (it is not necessary to include those files because we already watch the CMake _sources_ and
+    /// trigger a rebuild when they change).
+    fn inside_dst(&self, filename: &str) -> bool {
+        Path::new(filename).starts_with(&self.dst)
+    }
+}
+
+// Include `cargo:rerun-if` instructions just like `bindgen::CargoCallbacks` does. In addition, make
+// necessary adjustments to the names of items for the final bindings.
+impl bindgen::callbacks::ParseCallbacks for CustomCallbacks {
+    fn header_file(&self, filename: &str) {
+        // Make sure to rerun build when dependency outside of `dst/` changes.
+        if !self.inside_dst(filename) {
+            println!("cargo:rerun-if-changed={filename}");
+        }
+    }
+
+    fn include_file(&self, filename: &str) {
+        // Make sure to rerun build when dependency outside of `dst/` changes.
+        if !self.inside_dst(filename) {
+            println!("cargo:rerun-if-changed={filename}");
+        }
+    }
+
+    fn read_env_var(&self, key: &str) {
+        // Make sure to rerun build when environment variable changes.
+        println!("cargo:rerun-if-env-changed={key}");
+    }
+
+    fn item_name(&self, original_item_name: &str) -> Option<String> {
+        // Rename our wrapped custom exports to their intended names.
+        original_item_name.strip_prefix("RS_").map(str::to_owned)
+    }
+}
+
+/// Replaces all occurrences of pattern in file.
+///
+/// Note that this is not particularly efficient because it reads the entire file into memory before
+/// writing it back. Care should be taken when operating on large files.
+fn replace_in_file(path: &Path, pattern: &str, replacement: &str) -> io::Result<()> {
+    let buf = io::read_to_string(File::open(path)?)?;
+
+    let buf = buf.replace(pattern, replacement);
+
+    File::create(path)?.write_all(buf.as_bytes())?;
+
+    Ok(())
 }
 
 /// Parses the nodesets directory and returns vectors for `.c` files, `.h` files,
@@ -271,47 +493,3 @@ fn add_includes_to_wrapper(wrapper_path: PathBuf, include_files: Vec<PathBuf>) -
     Ok(())
 }
 
-#[derive(Debug)]
-struct CustomCallbacks {
-    /// Destination of CMake build of `open62541`.
-    dst: PathBuf,
-}
-
-impl CustomCallbacks {
-    /// Checks if `filename` is inside CMake destination.
-    ///
-    /// This may be used to ensure that we do not run a rebuild when files generated by CMake change
-    /// (it is not necessary to include those files because we already watch the CMake _sources_ and
-    /// trigger a rebuild when they change).
-    fn inside_dst(&self, filename: &str) -> bool {
-        Path::new(filename).starts_with(&self.dst)
-    }
-}
-
-// Include `cargo:rerun-if` instructions just like `bindgen::CargoCallbacks` does. In addition, make
-// necessary adjustments to the names of items for the final bindings.
-impl bindgen::callbacks::ParseCallbacks for CustomCallbacks {
-    fn header_file(&self, filename: &str) {
-        // Make sure to rerun build when dependency outside of `dst/` changes.
-        if !self.inside_dst(filename) {
-            println!("cargo:rerun-if-changed={filename}");
-        }
-    }
-
-    fn include_file(&self, filename: &str) {
-        // Make sure to rerun build when dependency outside of `dst/` changes.
-        if !self.inside_dst(filename) {
-            println!("cargo:rerun-if-changed={filename}");
-        }
-    }
-
-    fn read_env_var(&self, key: &str) {
-        // Make sure to rerun build when environment variable changes.
-        println!("cargo:rerun-if-env-changed={key}");
-    }
-
-    fn item_name(&self, original_item_name: &str) -> Option<String> {
-        // Rename our wrapped custom exports to their intended names.
-        original_item_name.strip_prefix("RS_").map(str::to_owned)
-    }
-}

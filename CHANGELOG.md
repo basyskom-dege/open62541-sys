@@ -5,6 +5,34 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Changed
+
+- Upgrade to build dependency bindgen version
+  [0.70.1](https://github.com/rust-lang/rust-bindgen/releases/tag/v0.70.1).
+
+## [0.4.5] - 2024-11-20
+
+### Added
+
+- Add feature flag `mbedtls` to build with encryption support by using bundled Mbed TLS version
+  [3.6.2](https://github.com/Mbed-TLS/mbedtls/releases/tag/mbedtls-3.6.2).
+- Include bindings for functions from header files `plugin/log.h`, `plugin/log_stdout.h`,
+  `plugin/pki.h`, `plugin/pki_default.h`, `plugin/securitypolicy.h`.
+
+## [0.4.4] - 2024-11-15
+
+### Changed
+
+- Upgrade to open62541 version [1.4.7](https://github.com/open62541/open62541/releases/tag/v1.4.7).
+
+## [0.4.3] - 2024-10-14
+
+### Changed
+
+- Upgrade to open62541 version [1.4.6](https://github.com/open62541/open62541/releases/tag/v1.4.6).
+
 ## [0.4.2] - 2024-08-09
 
 ### Changed
@@ -121,6 +149,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - First public release.
 
+[0.4.5]: https://github.com/HMIProject/open62541-sys/compare/v0.4.4...v0.4.5
+[0.4.4]: https://github.com/HMIProject/open62541-sys/compare/v0.4.3...v0.4.4
+[0.4.3]: https://github.com/HMIProject/open62541-sys/compare/v0.4.2...v0.4.3
 [0.4.2]: https://github.com/HMIProject/open62541-sys/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/HMIProject/open62541-sys/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/HMIProject/open62541-sys/compare/v0.3.3...v0.4.0

@@ -26,3 +26,17 @@ Make sure to check out the repository `open62541-sys` with submodules:
 ```shell
 git submodule update --init --recursive
 ```
+
+## Nodeset Generator
+
+Navigate to the toos folder.
+Oopen inputArgs.cmake and set the nodesets you want to generate. 
+Use the following commands to build the nodesets:
+
+```shell
+mkdir build && cd build
+cmake ..
+cmake --build .
+```
+
+After the build process, you can find the generated files in src/nodesets/. This directory will be included in the bindings generation process
